@@ -1,0 +1,157 @@
+/**
+ * What this file does: implements tenant-scoped review cycle and self-review persistence for the existing service layer.
+ * What calls it: src/services/review-service.ts through src/services/service-factory.ts.
+ * What it calls: Prisma client in src/lib/db.ts.
+ * One thing a junior engineer would likely get wrong when writing something similar: splitting the assignment update and review response write outside a transaction.
+ */
+import { db } from "@/lib/db";
+import { Prisma } from "@prisma/client";
+
+import type { RepositoryContext } from "@/repositories/repository-context";
+import type {
+  ReviewCycleOverview,
+  SelfReviewContextRecord,
+} from "@/repositories/repository-types";
+
+export class ReviewRepository {
+  async listCycles(ctx: RepositoryContext): Promise<ReviewCycleOverview[]> {
+    const cycles = await db.reviewCycle.findMany({
+      where: {
+        tenantId: ctx.tenantId,
+      },
+      include: {
+        _count: {
+          select: {
+            goals: true,
+            reviewAssignments: true,
+            feedbackRequests: true,
+          },
+        },
+      },
+      orderBy: { startDate: "desc" },
+    });
+
+    return cycles.map((cycle) => ({
+      id: cycle.id,
+      name: cycle.name,
+      description: cycle.description,
+      status: cycle.status,
+      startDate: cycle.startDate,
+      endDate: cycle.endDate,
+      counts: {
+        goals: cycle._count.goals,
+        reviewAssignments: cycle._count.reviewAssignments,
+        feedbackRequests: cycle._count.feedbackRequests,
+      },
+    }));
+  }
+
+  async findSelfReviewContext(
+    ctx: RepositoryContext,
+    input: {
+      cycleId: string;
+      reviewerUserId: string;
+      subjectEmployeeId: string;
+    },
+  ): Promise<SelfReviewContextRecord | null> {
+    const assignment = await db.reviewAssignment.findFirst({
+      where: {
+        tenantId: ctx.tenantId,
+        reviewCycleId: input.cycleId,
+        reviewerUserId: input.reviewerUserId,
+        subjectEmployeeId: input.subjectEmployeeId,
+        type: "SELF",
+      },
+      include: {
+        reviewCycle: {
+          select: { id: true, name: true, status: true },
+        },
+        response: {
+          select: { id: true },
+        },
+      },
+    });
+
+    if (!assignment) {
+      return null;
+    }
+
+    return {
+      assignmentId: assignment.id,
+      assignmentStatus: assignment.status,
+      cycleId: assignment.reviewCycle.id,
+      cycleName: assignment.reviewCycle.name,
+      cycleStatus: assignment.reviewCycle.status,
+      reviewerUserId: assignment.reviewerUserId,
+      subjectEmployeeId: assignment.subjectEmployeeId,
+      responseId: assignment.response?.id ?? null,
+    };
+  }
+
+  async submitSelfReview(
+    ctx: RepositoryContext,
+    input: {
+      assignmentId: string;
+      strengths: string;
+      areasToImprove: string;
+      accomplishments: string;
+      overallRating: number;
+      answers: Record<string, string>;
+      cycleId: string;
+      reviewerUserId: string;
+      subjectEmployeeId: string;
+    },
+  ) {
+    return db.$transaction(async (tx) => {
+      const claimed = await tx.reviewAssignment.updateMany({
+        where: {
+          tenantId: ctx.tenantId,
+          id: input.assignmentId,
+          reviewCycleId: input.cycleId,
+          reviewerUserId: input.reviewerUserId,
+          subjectEmployeeId: input.subjectEmployeeId,
+          type: "SELF",
+          status: { in: ["NOT_STARTED", "IN_PROGRESS"] },
+          reviewCycle: { status: "ACTIVE" },
+        },
+        data: {
+          status: "SUBMITTED",
+          submittedAt: new Date(),
+        },
+      });
+
+      if (claimed.count !== 1) return null;
+
+      const response = await tx.reviewResponse.create({
+        data: {
+          tenantId: ctx.tenantId,
+          reviewAssignmentId: input.assignmentId,
+          strengths: input.strengths,
+          areasToImprove: input.areasToImprove,
+          accomplishments: input.accomplishments,
+          overallRating: input.overallRating,
+          answersJson: input.answers as Prisma.InputJsonValue,
+        },
+      });
+
+      await tx.auditLog.create({
+        data: {
+          tenantId: ctx.tenantId,
+          actorUserId: ctx.actorUserId,
+          action: "REVIEW_SUBMITTED",
+          entityType: "reviewAssignment",
+          entityId: input.assignmentId,
+          metadataJson: {
+            cycleId: input.cycleId,
+            responseId: response.id,
+          },
+        },
+      });
+
+      return {
+        id: response.id,
+        updatedAt: response.updatedAt,
+      };
+    });
+  }
+}

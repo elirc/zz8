@@ -1,0 +1,411 @@
+// This schema defines the tenant-owned HR, performance, and integration domain.
+// It is called by Prisma Client in src/lib/db.ts and by seed data in prisma/seed.ts.
+// It calls PostgreSQL through Prisma's generated client and is the source of truth for persistence.
+// One thing a junior engineer would likely get wrong here is forgetting to put tenantId on every tenant-owned model.
+// ⚠️ SENIOR NOTE: the biggest long-term risk in this file is adding a new tenant-owned table without indexing and constraining tenantId consistently.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum PlatformRole {
+  PLATFORM_ADMIN
+  PLATFORM_SUPPORT
+  NONE
+}
+
+enum TenantRole {
+  TENANT_ADMIN
+  HR_ADMIN
+  MANAGER
+  EMPLOYEE
+  INTEGRATION_ADMIN
+}
+
+enum EmploymentStatus {
+  ONBOARDING
+  ACTIVE
+  LEAVE
+  TERMINATED
+}
+
+enum ReviewCycleStatus {
+  DRAFT
+  ACTIVE
+  CALIBRATING
+  COMPLETED
+}
+
+enum ReviewAssignmentType {
+  SELF
+  MANAGER
+  PEER
+}
+
+enum ReviewAssignmentStatus {
+  NOT_STARTED
+  IN_PROGRESS
+  SUBMITTED
+  APPROVED
+}
+
+enum GoalStatus {
+  DRAFT
+  ACTIVE
+  AT_RISK
+  COMPLETED
+  ARCHIVED
+}
+
+enum FeedbackRequestStatus {
+  PENDING
+  SUBMITTED
+  DECLINED
+}
+
+enum IntegrationType {
+  WORKDAY
+  GREENHOUSE
+  OKTA
+  BENEFITS_VENDOR
+}
+
+enum IntegrationDirection {
+  IMPORT
+  EXPORT
+  BIDIRECTIONAL
+}
+
+enum IntegrationJobStatus {
+  QUEUED
+  RUNNING
+  SUCCEEDED
+  FAILED
+  RETRY_REQUIRED
+  CANCELLED
+}
+
+enum AuditAction {
+  EMPLOYEE_CREATED
+  EMPLOYEE_UPDATED
+  REVIEW_SUBMITTED
+  INTEGRATION_JOB_RETRIED
+  INTEGRATION_JOB_PROCESSED
+}
+
+model Tenant {
+  id                  String               @id @default(cuid())
+  name                String
+  slug                String               @unique
+  createdAt           DateTime             @default(now())
+  updatedAt           DateTime             @updatedAt
+  memberships         TenantMembership[]
+  orgUnits            OrgUnit[]
+  employees           Employee[]
+  reviewCycles        ReviewCycle[]
+  goals               Goal[]
+  reviewAssignments   ReviewAssignment[]
+  reviewResponses     ReviewResponse[]
+  feedbackRequests    FeedbackRequest[]
+  calibrationSessions CalibrationSession[]
+  integrationConfigs  IntegrationConfig[]
+  mappingRules        MappingRule[]
+  integrationJobs     IntegrationJob[]
+  integrationLogs     IntegrationLog[]
+  auditLogs           AuditLog[]
+}
+
+model User {
+  id                   String              @id @default(cuid())
+  email                String              @unique
+  displayName          String
+  platformRole         PlatformRole        @default(NONE)
+  createdAt            DateTime            @default(now())
+  updatedAt            DateTime            @updatedAt
+  memberships          TenantMembership[]
+  employeeProfile      Employee?
+  reviewAssignments    ReviewAssignment[]
+  feedbackRequestsSent FeedbackRequest[]   @relation("FeedbackFromUser")
+  feedbackRequestsTo   FeedbackRequest[]   @relation("FeedbackToUser")
+  calibrationSessions  CalibrationSession[]
+  integrationJobs      IntegrationJob[]
+  auditLogs            AuditLog[]
+}
+
+model TenantMembership {
+  id         String     @id @default(cuid())
+  tenantId   String
+  userId     String
+  role       TenantRole
+  employeeId String?
+  tenant     Tenant     @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  user       User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  employee   Employee?  @relation(fields: [employeeId], references: [id], onDelete: SetNull)
+  createdAt  DateTime   @default(now())
+
+  @@unique([tenantId, userId])
+  @@index([tenantId, role])
+  @@index([employeeId])
+}
+
+model OrgUnit {
+  id         String    @id @default(cuid())
+  tenantId   String
+  name       String
+  code       String
+  parentId   String?
+  tenant     Tenant    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  parent     OrgUnit?  @relation("OrgUnitTree", fields: [parentId], references: [id], onDelete: SetNull)
+  children   OrgUnit[] @relation("OrgUnitTree")
+  employees  Employee[]
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
+
+  @@unique([tenantId, code])
+  @@index([tenantId, parentId])
+}
+
+model Employee {
+  id                 String             @id @default(cuid())
+  tenantId           String
+  userId             String?            @unique
+  managerId          String?
+  orgUnitId          String?
+  employeeNumber     String
+  firstName          String
+  lastName           String
+  workEmail          String
+  title              String
+  employmentType     String
+  status             EmploymentStatus   @default(ACTIVE)
+  compensationCents  Int
+  currency           String             @default("USD")
+  startDate          DateTime
+  endDate            DateTime?
+  tenant             Tenant             @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  user               User?              @relation(fields: [userId], references: [id], onDelete: SetNull)
+  manager            Employee?          @relation("ManagerReports", fields: [managerId], references: [id], onDelete: SetNull)
+  directReports      Employee[]         @relation("ManagerReports")
+  orgUnit            OrgUnit?           @relation(fields: [orgUnitId], references: [id], onDelete: SetNull)
+  memberships        TenantMembership[]
+  goals              Goal[]
+  subjectAssignments ReviewAssignment[] @relation("SubjectAssignments")
+  feedbackSubjects   FeedbackRequest[]
+  createdAt          DateTime           @default(now())
+  updatedAt          DateTime           @updatedAt
+
+  @@unique([tenantId, employeeNumber])
+  @@index([tenantId, managerId])
+  @@index([tenantId, orgUnitId])
+}
+
+model ReviewCycle {
+  id                  String              @id @default(cuid())
+  tenantId            String
+  name                String
+  description         String?
+  startDate           DateTime
+  endDate             DateTime
+  status              ReviewCycleStatus   @default(DRAFT)
+  tenant              Tenant              @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  goals               Goal[]
+  reviewAssignments   ReviewAssignment[]
+  feedbackRequests    FeedbackRequest[]
+  calibrationSessions CalibrationSession[]
+  createdAt           DateTime            @default(now())
+  updatedAt           DateTime            @updatedAt
+
+  @@index([tenantId, status])
+}
+
+model Goal {
+  id            String      @id @default(cuid())
+  tenantId      String
+  employeeId    String
+  reviewCycleId String
+  title         String
+  description   String
+  progressPct   Int         @default(0)
+  status        GoalStatus  @default(DRAFT)
+  dueDate       DateTime?
+  tenant        Tenant      @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  employee      Employee    @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+  reviewCycle   ReviewCycle @relation(fields: [reviewCycleId], references: [id], onDelete: Cascade)
+  createdAt     DateTime    @default(now())
+  updatedAt     DateTime    @updatedAt
+
+  @@index([tenantId, employeeId])
+  @@index([tenantId, reviewCycleId])
+}
+
+model ReviewAssignment {
+  id                String                 @id @default(cuid())
+  tenantId          String
+  reviewCycleId     String
+  subjectEmployeeId String
+  reviewerUserId    String
+  type              ReviewAssignmentType
+  status            ReviewAssignmentStatus @default(NOT_STARTED)
+  dueDate           DateTime?
+  submittedAt       DateTime?
+  tenant            Tenant                 @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  reviewCycle       ReviewCycle            @relation(fields: [reviewCycleId], references: [id], onDelete: Cascade)
+  subjectEmployee   Employee               @relation("SubjectAssignments", fields: [subjectEmployeeId], references: [id], onDelete: Cascade)
+  reviewerUser      User                   @relation(fields: [reviewerUserId], references: [id], onDelete: Cascade)
+  response          ReviewResponse?
+  createdAt         DateTime               @default(now())
+  updatedAt         DateTime               @updatedAt
+
+  @@index([tenantId, reviewCycleId])
+  @@index([tenantId, reviewerUserId, type])
+  @@index([tenantId, subjectEmployeeId, type])
+}
+
+model ReviewResponse {
+  id                 String           @id @default(cuid())
+  tenantId           String
+  reviewAssignmentId String           @unique
+  strengths          String
+  areasToImprove     String
+  accomplishments    String
+  overallRating      Int
+  answersJson        Json
+  tenant             Tenant           @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  reviewAssignment   ReviewAssignment @relation(fields: [reviewAssignmentId], references: [id], onDelete: Cascade)
+  createdAt          DateTime         @default(now())
+  updatedAt          DateTime         @updatedAt
+
+  @@unique([tenantId, reviewAssignmentId])
+}
+
+model FeedbackRequest {
+  id                String                @id @default(cuid())
+  tenantId          String
+  reviewCycleId     String
+  fromUserId        String
+  toUserId          String
+  subjectEmployeeId String
+  prompt            String
+  responseText      String?
+  status            FeedbackRequestStatus @default(PENDING)
+  submittedAt       DateTime?
+  tenant            Tenant                @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  reviewCycle       ReviewCycle           @relation(fields: [reviewCycleId], references: [id], onDelete: Cascade)
+  fromUser          User                  @relation("FeedbackFromUser", fields: [fromUserId], references: [id], onDelete: Cascade)
+  toUser            User                  @relation("FeedbackToUser", fields: [toUserId], references: [id], onDelete: Cascade)
+  subjectEmployee   Employee              @relation(fields: [subjectEmployeeId], references: [id], onDelete: Cascade)
+  createdAt         DateTime              @default(now())
+  updatedAt         DateTime              @updatedAt
+
+  @@index([tenantId, reviewCycleId, status])
+}
+
+model CalibrationSession {
+  id                String      @id @default(cuid())
+  tenantId          String
+  reviewCycleId     String
+  facilitatorUserId String
+  name              String
+  scheduledAt       DateTime
+  notes             String?
+  tenant            Tenant      @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  reviewCycle       ReviewCycle @relation(fields: [reviewCycleId], references: [id], onDelete: Cascade)
+  facilitatorUser   User        @relation(fields: [facilitatorUserId], references: [id], onDelete: Cascade)
+  createdAt         DateTime    @default(now())
+  updatedAt         DateTime    @updatedAt
+
+  @@index([tenantId, reviewCycleId])
+}
+
+model IntegrationConfig {
+  id                   String               @id @default(cuid())
+  tenantId             String
+  name                 String
+  integrationType      IntegrationType
+  direction            IntegrationDirection
+  scheduleCron         String
+  isActive             Boolean              @default(true)
+  lastSuccessfulSyncAt DateTime?
+  tenant               Tenant               @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  mappingRules         MappingRule[]
+  jobs                 IntegrationJob[]
+  createdAt            DateTime             @default(now())
+  updatedAt            DateTime             @updatedAt
+
+  @@index([tenantId, integrationType])
+}
+
+model MappingRule {
+  id                  String            @id @default(cuid())
+  tenantId            String
+  integrationConfigId String
+  sourceField         String
+  targetField         String
+  transformStrategy   String?
+  isRequired          Boolean           @default(false)
+  tenant              Tenant            @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  integrationConfig   IntegrationConfig @relation(fields: [integrationConfigId], references: [id], onDelete: Cascade)
+  createdAt           DateTime          @default(now())
+  updatedAt           DateTime          @updatedAt
+
+  @@index([tenantId, integrationConfigId])
+}
+
+model IntegrationJob {
+  id                  String               @id @default(cuid())
+  tenantId            String
+  integrationConfigId String
+  requestedByUserId   String
+  status              IntegrationJobStatus @default(QUEUED)
+  payloadJson         Json
+  errorMessage        String?
+  retryReason         String?
+  attemptCount        Int                  @default(0)
+  claimToken          String?
+  startedAt           DateTime?
+  finishedAt          DateTime?
+  tenant              Tenant               @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  integrationConfig   IntegrationConfig    @relation(fields: [integrationConfigId], references: [id], onDelete: Cascade)
+  requestedByUser     User                 @relation(fields: [requestedByUserId], references: [id], onDelete: Cascade)
+  logs                IntegrationLog[]
+  createdAt           DateTime             @default(now())
+  updatedAt           DateTime             @updatedAt
+
+  @@index([tenantId, status])
+  @@index([tenantId, claimToken])
+  @@index([tenantId, integrationConfigId])
+}
+
+model IntegrationLog {
+  id               String         @id @default(cuid())
+  tenantId         String
+  integrationJobId String
+  level            String
+  message          String
+  detailsJson      Json?
+  tenant           Tenant         @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  integrationJob   IntegrationJob @relation(fields: [integrationJobId], references: [id], onDelete: Cascade)
+  createdAt        DateTime       @default(now())
+
+  @@index([tenantId, integrationJobId])
+}
+
+model AuditLog {
+  id           String      @id @default(cuid())
+  tenantId     String
+  actorUserId  String?
+  action       AuditAction
+  entityType   String
+  entityId     String
+  metadataJson Json?
+  tenant       Tenant      @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  actorUser    User?       @relation(fields: [actorUserId], references: [id], onDelete: SetNull)
+  createdAt    DateTime    @default(now())
+
+  @@index([tenantId, entityType, entityId])
+  @@index([tenantId, action])
+}

@@ -1,0 +1,211 @@
+/**
+ * What this file does: implements tenant-scoped integration config, job, and log persistence for the existing service layer.
+ * What calls it: src/services/integration-service.ts through src/services/service-factory.ts.
+ * What it calls: Prisma client in src/lib/db.ts.
+ * One thing a junior engineer would likely get wrong when writing something similar: thinking support tooling is exempt from tenant scoping because only admins use it.
+ */
+import { db } from "@/lib/db";
+import { Prisma } from "@prisma/client";
+
+import type { RepositoryContext } from "@/repositories/repository-context";
+import type {
+  IntegrationConfigRecord,
+  IntegrationJobRecord,
+} from "@/repositories/repository-types";
+
+export class IntegrationRepository {
+  async listConfigs(ctx: RepositoryContext): Promise<IntegrationConfigRecord[]> {
+    return db.integrationConfig.findMany({
+      where: {
+        tenantId: ctx.tenantId,
+      },
+      orderBy: { name: "asc" },
+    });
+  }
+
+  async findConfigById(ctx: RepositoryContext, integrationConfigId: string) {
+    return db.integrationConfig.findFirst({
+      where: {
+        tenantId: ctx.tenantId,
+        id: integrationConfigId,
+      },
+    });
+  }
+
+  async listJobs(ctx: RepositoryContext): Promise<IntegrationJobRecord[]> {
+    return db.integrationJob.findMany({
+      where: {
+        tenantId: ctx.tenantId,
+      },
+      include: {
+        integrationConfig: {
+          select: { id: true, name: true, integrationType: true },
+        },
+        requestedByUser: {
+          select: { id: true, displayName: true },
+        },
+        logs: {
+          orderBy: { createdAt: "desc" },
+          take: 3,
+          select: { id: true, level: true, message: true, createdAt: true },
+        },
+      },
+      orderBy: { createdAt: "desc" },
+      take: 20,
+    });
+  }
+
+  async createJob(
+    ctx: RepositoryContext,
+    input: {
+      integrationConfigId: string;
+      payloadJson: unknown;
+      requestedByUserId: string;
+    },
+  ) {
+    return db.integrationJob.create({
+      data: {
+        tenantId: ctx.tenantId,
+        integrationConfigId: input.integrationConfigId,
+        requestedByUserId: input.requestedByUserId,
+        payloadJson: input.payloadJson as Prisma.InputJsonValue,
+        status: "QUEUED",
+      },
+      include: {
+        integrationConfig: {
+          select: { id: true, name: true, integrationType: true },
+        },
+        requestedByUser: {
+          select: { id: true, displayName: true },
+        },
+        logs: {
+          select: { id: true, level: true, message: true, createdAt: true },
+        },
+      },
+    });
+  }
+
+  async findJobById(ctx: RepositoryContext, jobId: string) {
+    return db.integrationJob.findFirst({
+      where: {
+        tenantId: ctx.tenantId,
+        id: jobId,
+      },
+      include: {
+        integrationConfig: {
+          select: { id: true, name: true, integrationType: true },
+        },
+        requestedByUser: {
+          select: { id: true, displayName: true },
+        },
+        logs: {
+          orderBy: { createdAt: "desc" },
+          take: 3,
+          select: { id: true, level: true, message: true, createdAt: true },
+        },
+      },
+    });
+  }
+
+  async queueRetry(
+    ctx: RepositoryContext,
+    input: { jobId: string; reason: string },
+  ) {
+    await db.integrationJob.updateMany({
+      where: {
+        tenantId: ctx.tenantId,
+        id: input.jobId,
+      },
+      data: {
+        status: "QUEUED",
+        retryReason: input.reason,
+        errorMessage: null,
+        startedAt: null,
+        finishedAt: null,
+        attemptCount: {
+          increment: 1,
+        },
+      },
+    });
+
+    return this.findJobById(ctx, input.jobId);
+  }
+
+  async claimQueuedJobs(ctx: RepositoryContext, batchSize: number) {
+    const jobs = await db.integrationJob.findMany({
+      where: {
+        tenantId: ctx.tenantId,
+        status: "QUEUED",
+      },
+      include: {
+        integrationConfig: {
+          select: { id: true, name: true, integrationType: true },
+        },
+        requestedByUser: {
+          select: { id: true, displayName: true },
+        },
+        logs: {
+          orderBy: { createdAt: "desc" },
+          take: 3,
+          select: { id: true, level: true, message: true, createdAt: true },
+        },
+      },
+      orderBy: { createdAt: "asc" },
+      take: batchSize,
+    });
+
+    for (const job of jobs) {
+      await db.integrationJob.updateMany({
+        where: {
+          tenantId: ctx.tenantId,
+          id: job.id,
+        },
+        data: {
+          status: "RUNNING",
+          startedAt: new Date(),
+        },
+      });
+    }
+
+    return jobs;
+  }
+
+  async completeJob(
+    ctx: RepositoryContext,
+    input: { jobId: string; success: boolean; errorMessage?: string | null },
+  ) {
+    await db.integrationJob.updateMany({
+      where: {
+        tenantId: ctx.tenantId,
+        id: input.jobId,
+      },
+      data: {
+        status: input.success ? "SUCCEEDED" : "FAILED",
+        errorMessage: input.success ? null : (input.errorMessage ?? "Integration failed."),
+        finishedAt: new Date(),
+      },
+    });
+
+    return this.findJobById(ctx, input.jobId);
+  }
+
+  async addLog(
+    ctx: RepositoryContext,
+    input: {
+      jobId: string;
+      level: string;
+      message: string;
+      detailsJson?: unknown;
+    },
+  ) {
+    await db.integrationLog.create({
+      data: {
+        tenantId: ctx.tenantId,
+        integrationJobId: input.jobId,
+        level: input.level,
+        message: input.message,
+        detailsJson: input.detailsJson as Prisma.InputJsonValue | undefined,
+      },
+    });
+  }
+}
