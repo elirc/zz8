@@ -89,3 +89,71 @@
 **What to look for:** The `useIntegrationJobs()`, `useRetryIntegrationJob()`, and `useProcessQueuedJobs()` calls.
 **What to trace:** Calls hooks in `src/hooks/useIntegrationOps.ts`, which call routes under `src/app/api/integration-jobs/`.
 **What a junior would likely miss:** The panel is only orchestrating user intent; the real rules still live in services.
+
+---
+
+## Verification notes on the steps above (2026-10 docs pass)
+
+- Step 1: "Every protected request starts here." True: every route calls `buildRouteContext()` first. **Addition:** what a junior would also miss is the fallback on lines 17-19. With no headers, the caller becomes an HR admin.
+- Step 3: "Called by all three service classes; consumed by all repository classes." True (`employee-service.ts:16`, `review-service.ts:13`, `integration-service.ts:17`; every repository method takes `ctx`).
+- Step 5: "Called by `src/services/employeeService.ts`, ..." True; each wrapper is one line (`employeeService.ts:3` etc.).
+- Step 7: "`updateMany()` is used here to keep tenant scoping explicit on writes." True (`employee-repository.ts:147-153`). Side effect: `updateMany` returns only a count, so the repository has to re-read the row with `findById` (line 159).
+- Step 10: "The response upsert and assignment status update belong in one transaction." True, and they are (`review-repository.ts:105`). The response is now a `create`, and the transaction also re-checks the status and writes the audit row, which stops a concurrent double submit (finding L4, fixed).
+- Step 12: "Queue workers still need tenant-scoped filters on claims and completions." True and present. The more important miss used to be that the claim was not atomic (finding L1). It is now a conditional, token-carrying update (`integration-repository.ts:182-207`).
+- Step 13: "Background processing should still emit logs and terminal states consistently." The happy path does; an exception mid-loop does not (finding L2, run).
+
+## Check yourself (with answers)
+
+Each question is answerable from the file named in the step. Answers cite the line.
+
+| Step | Question | Answer |
+| --- | --- | --- |
+| 1 | What does `GET /api/employees` return with no headers? | 200 and the full northstar directory: the request is treated as `user_hr_admin` (`session.ts:17-19`, `demo-sessions.ts:13-20`). |
+| 1 | Which status does an empty `x-demo-user-id: ""` produce? | 401. `??` keeps empty strings, and `demoSessions[""]` is undefined (`session.ts:17,22-24`). |
+| 2 | Can `assertPlatformRole` ever throw in the current code? | No. Its only caller already checked the role is in the allowed list (`integration-service.ts:108,115-119`). |
+| 2 | Does `PLATFORM_SUPPORT` bypass `assertTenantRole`? | No, only `PLATFORM_ADMIN` does (`permissions.ts:16`). |
+| 3 | Which session field becomes `actorUserId`? | `session.userId` (`repository-context.ts:17`). |
+| 4 | Which two unique constraints does `ReviewResponse` have? | `reviewAssignmentId @unique` (line 271) and `@@unique([tenantId, reviewAssignmentId])` (line 282). |
+| 4 | What stops a manager from another tenant being stored in `Employee.managerId`? | Nothing in the schema (line 191). Only the service check in `employee-service.ts:112-118`. |
+| 5 | How many `AuditLogRepository` instances exist at runtime? | One, shared by all three services (`service-factory.ts:15`). |
+| 6 | Can an employee be their own manager? | Yes. `assertTenantReferences` only checks the manager exists in the tenant (`employee-service.ts:112-118`). Test G3, run. |
+| 6 | What does the update audit row record? | Only the names of the changed fields (`employee-service.ts:100`), not old or new values. |
+| 7 | Which fields does `list()` return for each employee? | Every scalar column, including `compensationCents`, plus the selected `manager` and `orgUnit` fields (`employee-repository.ts:46-53`; `include` keeps all scalars). |
+| 8 | Is the `search` parameter used? | No. `GET()` calls `listEmployees(session)` with no search (`route.ts:15`). |
+| 9 | Which assignment statuses can submit? | The service lets anything except `SUBMITTED` through (`review-service.ts:68`). The repository write accepts only `NOT_STARTED` and `IN_PROGRESS` (`review-repository.ts:114`), so `APPROVED` ends as a 404 from `review-service.ts:84-86`. |
+| 9 | Is the cycle's `endDate` checked? | No; only `cycleStatus === "ACTIVE"` (`review-service.ts:60`). |
+| 10 | How is the response written now, and what stops a duplicate? | `tx.reviewResponse.create` (`review-repository.ts:125-135`), after the conditional `updateMany` (`:106-123`). A second response would also violate `reviewAssignmentId @unique` (`schema.prisma:271`). The earlier code used an `upsert` on `tenantId_reviewAssignmentId`. |
+| 11 | Which job statuses can be retried? | `FAILED` and `RETRY_REQUIRED` (`integration-service.ts:88`). |
+| 11 | Is there a retry limit? | No (test J7, run). |
+| 11 | Does queueing check `config.isActive`? | No (`integration-service.ts:58-71`; test J10, run). |
+| 12 | What status do the rows returned by `claimQueuedJobs` carry? | The pre-update value, `QUEUED` (line 170 returns the `findMany` result; test J3, run). |
+| 12 | Which write increments `attemptCount`? | Only `queueRetry` (lines 125-127). |
+| 13 | How is a failure decided? | `payloadJson.simulateFailure` truthy (lines 25-29). |
+| 14 | What does the provider return on the server for the active session? | `"user_hr_admin"` (`demo-session-provider.tsx:39-41`). |
+| 15 | What batch size does the UI send? | 5 (`integration-operations-panel.tsx:51`). |
+
+## Optional extra steps
+
+### Step 16 — src/lib/http/api-response.ts
+**Why read this:** Every error the API returns passes through `handleRouteError()`.
+**What to look for:** the single `isAppError` branch (line 20) and the 500 fallback (lines 32-40).
+**What to trace:** Called by all eight route files.
+**What a junior would likely miss:** `ZodError` and the JSON `SyntaxError` are not `AppError`, so bad input becomes 500 (finding A2).
+
+### Step 17 — src/lib/demo/demo-sessions.ts
+**Why read this:** It is the real role table of the app.
+**What to look for:** `DEFAULT_DEMO_SESSION` (lines 13-20) and the platform admin without `employeeId` (lines 23-29).
+**What to trace:** Used by `session.ts`, `client.ts`, and the provider.
+**What a junior would likely miss:** editing `TenantMembership` rows in the database changes nothing; this object decides.
+
+### Step 18 — src/hooks/useReviewCycles.ts
+**Why read this:** It shows a client inventing data the API does not return.
+**What to look for:** lines 37-42.
+**What to trace:** Feeds `review-cycle-panel.tsx:66`.
+**What a junior would likely miss:** the "AVAILABLE" label is not from the server.
+
+### Step 19 — src/lib/repositories/contracts.ts (read last, as a cautionary file)
+**Why read this:** To recognize leftover code.
+**What to look for:** method names that do not exist in `src/repositories/` (`listQueuedJobs`, `markRunning`, `markProcessed`).
+**What to trace:** Nothing imports it.
+**What a junior would likely miss:** a well-commented file can still be dead. Search for imports before trusting it.

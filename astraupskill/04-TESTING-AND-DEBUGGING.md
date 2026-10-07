@@ -11,7 +11,7 @@ Run one file with `npm test -- run src/tests/workflow-atomicity.test.ts` from th
 When debugging a zero-row update, log the tenant, ID, expected status, and claim token hash or opaque token identifier, never credentials or full payload secrets. Treat zero as a conflict/loser result, not as permission to retry blindly.
 ## Test review questions
 
-Ask whether a test reaches the method the application uses. A direct test of a copied reducer cannot prove a repository predicate. The workflow test calls the real worker function and the real review service, while a fake implements their repository interfaces. This catches wrong argument names and verifies that a null completion suppresses the stale log.
+Ask whether a test reaches the method the application uses. A direct test of a copied reducer cannot prove a repository predicate. The workflow test calls the real worker function and the real review service. The review tests also run the real `ReviewRepository` over an in-memory Prisma double, but the claim-token test gives the worker a hand-written fake repository (`src/tests/workflow-atomicity.test.ts:228-240`). That fake catches wrong argument names and verifies that a null completion suppresses the stale log. It cannot prove the `status: "QUEUED"` and `claimToken` predicates in `src/repositories/integration-repository.ts:188` and `:222`.
 
 Ask whether failure state is independently observed. A rollback test should retain a snapshot taken before the transaction, force an audit failure, then compare the committed store with that snapshot. Do not reset the store inside the assertion path and call that rollback. For a race, have two callers share a store whose conditional update can only return one positive count; assert one winner and one loser.
 

@@ -123,3 +123,40 @@ Reviewer focus:
 - `src/hooks/useEmployees.ts` and peers — verify cache invalidation follows mutations.
 - `src/tests/auth-permissions.test.ts` — verify the route-level 403 path is exercised.
 Stronger reviewer flag: compatibility wrappers are acceptable only because they are documented and the runtime path is stable again.
+
+---
+
+## Audit of this journal against the code (2026-10 docs pass)
+
+The journal is a historical record, so its entries are left as written. This table checks each verifiable claim against the current tree. Labels: (run) executed in the scratch harness described in testing-rationale.md; (by reading) from the code only; (not verifiable) needs installed dependencies or a database.
+
+| Journal claim | Where | Verdict |
+| --- | --- | --- |
+| "multi-tenancy is first-class" | Stage 1 | Holds: all 25 Prisma calls filter by `tenantId` (by reading; 21 when first counted). The tenant id itself is taken from a header (auth doc A3). |
+| "row-level tenant ownership on domain tables" | Stage 2 | Holds: every model except `Tenant` and `User` has `tenantId` (`prisma/schema.prisma`). Foreign keys are not tenant-composite (domain-model.md). |
+| "a demo-session adapter instead of a full identity provider" | Stage 2 | Holds. The adapter's default is a privileged user (auth doc A1, run). |
+| "permission checks live in services" | Stage 3 | Holds for all 11 service methods (run, matrix G1). |
+| "audit logging is append-only" | Stage 3 | Holds in the sense that the app has no update or delete on `AuditLog` (`audit-log-repository.ts` has only `create`). Nothing in the database enforces it, and two of six write paths log nothing (test J12, run). |
+| Compatibility wrappers in `employeeService.ts`, `reviewCycleService.ts`, `integrationService.ts` | Stage 4 | Holds: each is one line calling the factory. Both spellings are live; see docs/architecture/README.md. |
+| "green lint, green tests, and a successful production build" | Stage 5 | Not verifiable here: no `node_modules` in this checkout, and installing was out of scope. |
+| "remove stale duplicate files where possible" | Stage 5 | One stale file remains: `src/lib/repositories/contracts.ts` is imported by nothing and describes a different repository API (by reading). |
+| "restore missing repository/job modules" | Stage 5 | The restored modules are present and wired (`src/repositories/*.ts`, `src/jobs/*.ts`). |
+| Slice 1: "verify tenant mismatch rejection and default demo actor behavior" | PR Slices | The flag was right to name the default actor: it is an HR admin. |
+| Slice 2: "verify Zod parsing happens before the service call" | PR Slices | True (`employees/route.ts:25-26`). Zod failures are then mapped to 500, not 400 (auth doc A2). |
+| Slice 2: "global foreign keys like `managerId` still need same-tenant existence checks" | PR Slices | Present (`employee-service.ts:107-128`). Self-reference is still allowed (test G3, run). |
+| Slice 3: "verify cycle and assignment status guards" | PR Slices | Present, but only `SUBMITTED` is blocked (test R1) and the guard is not repeated in the write (test R5). |
+| Slice 4: "verify queued jobs always end in a logged terminal state" | PR Slices | **Does not hold** on the error path: an exception mid-batch leaves claimed jobs in `RUNNING` with no way out (test J9, run). It also does not hold under concurrency: two sweeps both complete the same job (test J1, run). |
+| Slice 4: "verify retryable states and platform-vs-tenant access" | PR Slices | Retryable states are enforced sequentially (tests J6, J15) but not under concurrency (test J8). The platform branch in `processQueuedJobs` contains a no-op guard (auth doc A5). |
+| Slice 5: "verify cache invalidation follows mutations" | PR Slices | Holds: every mutation invalidates its queries (`useEmployees.ts:62-64,85-87`, `useReviewCycles.ts:70-72`, `useIntegrationOps.ts:94,109,124`). The review list still shows stale status because the hook invents it (`useReviewCycles.ts:39-40`). |
+
+## What a next stage would contain
+
+Grounded in the findings, in order of risk:
+
+1. Done since this list was written: the job claim, completion, retry and self-review writes now carry the expected source status (`integration-repository.ts:116,184,217`; `review-repository.ts:106`), with the audit rows moved into the same transactions. See `astraupskill/`. Left over: map their `null` results to 409 instead of 404.
+2. Per-job error handling in the sweep, plus a reaper for stale `RUNNING` jobs (which would give `RETRY_REQUIRED` a writer).
+3. Map Zod, JSON and Prisma unique errors to 400/409 in `handleRouteError`.
+4. Reject header-less requests; read roles from `TenantMembership`.
+5. Delete `src/lib/repositories/contracts.ts`; wire or remove `search` and `useUpdateEmployee`.
+6. Return the caller's self-assignment status from `listCycles` and drop the invented value in the hook.
+7. Replace the tenant-isolation test's private fake with a test of the real repository.

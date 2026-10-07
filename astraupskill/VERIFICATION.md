@@ -59,13 +59,13 @@ Test Files  5 passed (5)
 
 and `npx tsc --noEmit` printing nothing with exit code 0. `--maxWorkers=1` is not required for correctness; it keeps the output readable and avoids a slow cold start on a laptop. On Windows, macOS and Linux these two commands are identical — earlier versions of this chapter printed a `node_modules/.bin/vitest.mjs` path that does not exist in this project, and a `node_modules/.bin/tsc.cmd` path that only exists on Windows. Use `npm test --` and `npx`.
 
-The four workflow tests cover: self-review audit rollback, one-winner concurrency on the real repository predicate, rejection of a mismatched subject employee, and immutable-token completion with stale-log suppression. The four older tests cover tenant isolation, permission boundaries, validation bounds and invalid review transitions.
+The four workflow tests cover: self-review audit rollback, one-winner concurrency on the real review-repository predicate, rejection of a mismatched subject employee, and immutable-token completion with stale-log suppression. The four older tests cover tenant isolation, permission boundaries, validation bounds and invalid review transitions.
 
 ## What this evidence does and does not establish
 
 These are service and repository-contract tests. They run against an in-memory Prisma double (chapter 4 shows how it is built) and against hand-written repository fakes. They establish that:
 
-- every predicate the change added is actually present in the `where` clause the repository sends;
+- every predicate the change added to `ReviewRepository.submitSelfReview` is actually present in the `where` clause it sends (the integration-repository predicates are **not** exercised: the claim-token test uses a hand-written fake repository, `src/tests/workflow-atomicity.test.ts:228-240`);
 - all three writes of a self-review submission sit inside one `$transaction` callback, so a failing audit insert discards the whole thing;
 - the worker treats a `null` completion as "I no longer own this job" and writes no log.
 
